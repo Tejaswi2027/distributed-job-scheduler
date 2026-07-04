@@ -1,0 +1,162 @@
+# Implementation Plan: Distributed Job Scheduler
+
+This plan outlines the architecture, database schema, concurrency mechanisms, and directory structure for building a production-grade distributed job scheduler. 
+
+---
+
+## Architecture Overview
+
+A production-grade distributed job scheduler requires a robust storage layer, a reliable coordination mechanism, and decoupled worker nodes. For this assignment, we will use a **PostgreSQL-backed queueing model** instead of Redis/RabbitMQ.
+
+```mermaid
+graph TD
+    Client[REST API Clients] --> API[API Server / Express]
+    API --> DB[(PostgreSQL DB)]
+    Dashboard[React Dashboard] --> API
+    
+    subgraph Workers [Worker Nodes Pool]
+        W1[Worker Service 1]
+        W2[Worker Service 2]
+    end
+    
+    Workers -- Polls / SKIP LOCKED --> DB
+    Workers -- Updates State & Heartbeats --> DB
+    
+    subgraph Scheduled Manager
+        CronEngine[Cron & Delay Evaluator]
+    end
+    CronEngine -- Evaluates & Enqueues --> DB
+```
+
+### Why PostgreSQL for the Queue?
+*   **ACID Compliance**: Enqueuing a job and updating related application data can be done in a single transaction.
+*   **Atomic Claiming (`SKIP LOCKED`)**: PostgreSQL 9.5+ supports `SELECT ... FOR UPDATE SKIP LOCKED`. This allows multiple workers to fetch jobs in parallel without race conditions or lock contention.
+*   **Relational Integrity**: Detailed logs, worker statistics, organizations, projects, and queues are naturally relational.
+
+---
+
+## User Review Required
+
+Please review the following structural decisions and tech stack selections:
+
+1.  **Backend Stack**: We will use **Node.js (TypeScript)** with **Express** or **Fastify** and **Prisma** (for migrations and ORM). TypeScript provides static type-safety, which is crucial for clean architecture.
+2.  **Worker Concurrency**: Workers will run in separate Node.js processes. Each worker will poll the database for new work, spawn a worker-level concurrency pool (using async task limits), send heartbeats, and capture execution metrics.
+3.  **Frontend Dashboard**: We will build a single-page application using **React (TypeScript)** and clean, responsive vanilla CSS. It will interact with the API Server to show real-time stats (polling or WebSockets).
+
+---
+
+## Proposed Database Schema
+
+We will create a highly normalized PostgreSQL schema. Below are the key tables and their roles:
+
+```mermaid
+erDiagram
+    Users ||--o{ UserOrganizations : "belongs to"
+    Organizations ||--o{ UserOrganizations : "contains"
+    Organizations ||--o{ Projects : "owns"
+    Projects ||--o{ Queues : "has"
+    Queues ||--o{ Jobs : "queues"
+    Jobs ||--o{ JobExecutions : "has history"
+    Jobs }|--|| RetryPolicies : "uses"
+    Jobs ||--o{ ScheduledJobs : "optionally linked"
+    Workers ||--o{ JobExecutions : "executes"
+    JobExecutions ||--o{ JobLogs : "generates"
+    Jobs ||--o{ DeadLetterQueue : "moves to on permanent failure"
+```
+
+### Table Definitions & Design Details
+
+1.  **Users & Organizations / Projects**:
+    *   `users`: ID (UUID), email, password_hash, created_at, updated_at.
+    *   `organizations`: ID (UUID), name, created_at.
+    *   `projects`: ID (UUID), organization_id (FK), name, api_key (indexed for fast API auth).
+2.  **Queues**:
+    *   `queues`: ID (UUID), project_id (FK), name, priority (integer), concurrency_limit (integer), is_paused (boolean), created_at.
+3.  **Jobs**:
+    *   `jobs`: ID (UUID), queue_id (FK), status (enum: `QUEUED`, `SCHEDULED`, `CLAIMED`, `RUNNING`, `COMPLETED`, `FAILED`, `DLQ`), payload (JSONB), priority (integer), run_at (timestamp), max_retries (integer), retry_count (integer), retry_policy_id (FK), batch_id (UUID, optional), created_at, updated_at.
+    *   *Index*: `idx_jobs_claim` on `(status, run_at, priority DESC, created_at ASC)` to optimize worker polling.
+4.  **JobExecutions**:
+    *   `job_executions`: ID (UUID), job_id (FK), worker_id (FK, nullable), status (enum), error_message (text), started_at, finished_at, duration_ms (integer).
+5.  **JobLogs**:
+    *   `job_logs`: ID (UUID), execution_id (FK), level (string), message (text), timestamp.
+6.  **Workers & Heartbeats**:
+    *   `workers`: ID (UUID), name, hostname, concurrency_limit (integer), active_jobs (integer), status (enum: `ACTIVE`, `DEREGISTERED`, `DEAD`), last_heartbeat_at, started_at.
+7.  **Retry Policies**:
+    *   `retry_policies`: ID (UUID), name, strategy (enum: `FIXED`, `LINEAR`, `EXPONENTIAL`), base_delay_seconds (integer), max_delay_seconds (integer).
+8.  **Dead Letter Queue (DLQ)**:
+    *   `dead_letter_queue`: ID (UUID), job_id (FK), failed_at, reason (text), payload (JSONB).
+
+---
+
+## Concurrency & Reliability Design
+
+### 1. Atomic Job Claiming (The Core Algorithm)
+To prevent multiple workers from executing the same job:
+```sql
+BEGIN;
+-- Select next available job from a specific queue or across queues
+SELECT id FROM jobs
+WHERE status = 'QUEUED' AND run_at <= NOW()
+ORDER BY priority DESC, created_at ASC
+LIMIT 1
+FOR UPDATE SKIP LOCKED;
+
+-- If a job is returned, update its status
+UPDATE jobs
+SET status = 'RUNNING', worker_id = :workerId, updated_at = NOW()
+WHERE id = :jobId;
+
+-- Insert execution record
+INSERT INTO job_executions (job_id, worker_id, status, started_at)
+VALUES (:jobId, :workerId, 'RUNNING', NOW());
+COMMIT;
+```
+*Trade-off*: Long transactions can block other updates. We will keep this claim transaction extremely short (just a select and update).
+
+### 2. Worker Heartbeats & Recovery (Reaping Dead Workers)
+*   **Heartbeat**: Workers will run a background loop that updates `last_heartbeat_at = NOW()` and reports active job counts every 5 seconds.
+*   **Reaping**: A background orchestrator task runs every 10 seconds. It checks for workers where `last_heartbeat_at < NOW() - 30 seconds`. It marks the worker as `DEAD` and re-queues or fails any jobs that were marked `RUNNING` on that worker (depending on their retry policies).
+
+### 3. Graceful Shutdown
+On `SIGTERM` or `SIGINT`, the worker will:
+1.  Stop polling for new jobs.
+2.  Wait for current in-progress jobs to finish execution (up to a configurable timeout, e.g., 10 seconds).
+3.  For jobs that do not finish in time, mark them as `FAILED` or `QUEUED` (so they can be retried or grabbed by another worker) and shut down.
+4.  Deregister the worker in the DB.
+
+---
+
+## Proposed Milestones
+
+1.  **Milestone 1: Database Setup & Prisma Schema**
+    *   Initialize Node.js, TypeScript, and Prisma.
+    *   Define DB schema with primary keys, foreign keys, and indexes.
+    *   Write seed scripts.
+2.  **Milestone 2: Backend Core & Clean Architecture**
+    *   Implement authentication and middleware.
+    *   Build REST APIs for Projects, Queues, Jobs (immediate, delayed, scheduled, batch).
+    *   Implement job submission logic.
+3.  **Milestone 3: Worker Service & Concurrency Core**
+    *   Implement the poller using `FOR UPDATE SKIP LOCKED`.
+    *   Implement task executors with configurable concurrency limits.
+    *   Implement retry policies (Fixed, Linear, Exponential).
+    *   Implement heartbeats and the dead worker reaper.
+    *   Write worker integration tests.
+4.  **Milestone 4: Dashboard Frontend**
+    *   Build a responsive web application showing queues, worker health, and system metrics.
+    *   Include controls to pause/resume queues and retry failed/DLQ jobs.
+5.  **Milestone 5: Documentation & Diagrams**
+    *   Generate ER and system diagrams.
+    *   Write API docs and the design decisions paper.
+
+---
+
+## Verification Plan
+
+### Automated Tests
+*   **Unit Tests**: Validate retry backoff calculations, cron parsing, and config validation.
+*   **Integration Tests**: Run concurrent worker nodes polling a test DB to verify that no job is executed twice.
+
+### Manual Verification
+*   Simulate worker failure (using `kill -9`) and verify that the reaper picks up the orphaned jobs.
+*   Verify queue pause/resume operations visually.
